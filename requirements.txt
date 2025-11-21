@@ -5,4 +5,5 @@ pydantic>=2.9.0
 pymongo==4.6.0
 requests==2.31.0
 email-validator==2.1.0
-reportlab==4.0.7
+aiofiles==23.2.1
+python-multipart==0.0.9

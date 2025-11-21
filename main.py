@@ -1,18 +1,21 @@
 import os
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import Optional, List, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from bson import ObjectId
 
-from database import db, create_document, get_documents
+from database import db, create_document
 from schemas import User as UserSchema, Message as MessageSchema, Block as BlockSchema, Session as SessionSchema, Adminlog as AdminlogSchema
 
 import hashlib
+import shutil
+import mimetypes
 
 app = FastAPI(title="Slash Messenger API")
 
@@ -23,6 +26,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Ensure uploads directory exists and mount static files
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+except Exception:
+    # Mounting static files should not block server startup
+    pass
 
 security = HTTPBearer(auto_error=False)
 
@@ -91,6 +103,16 @@ def public_user(u: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+@app.get("/")
+def read_root():
+    return {"message": "Slash Messenger API running"}
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+
+
 async def get_current_session(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if creds is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -106,11 +128,6 @@ async def get_current_session(request: Request, creds: Optional[HTTPAuthorizatio
         db["session"].update_many({"user_id": user["_id"]}, {"$set": {"valid": False}})
         raise HTTPException(status_code=403, detail="Account is suspended")
     return {"session": sess, "user": user}
-
-
-@app.get("/")
-def read_root():
-    return {"message": "Slash Messenger API running"}
 
 
 @app.get("/test")
@@ -234,11 +251,6 @@ def search_users(q: str, ctx=Depends(get_current_session)):
     ], "is_active": True}
     users = list(db["user"].find(query).limit(20))
 
-    # Apply block visibility: if either party blocked, hide avatar
-    blocked_any = db["block"].find_one({"$or": [
-        {"blocker_id": ctx["user"]["_id"], "blocked_id": {"$in": [u["_id"] for u in users]}},
-        {"blocked_id": ctx["user"]["_id"], "blocker_id": {"$in": [u["_id"] for u in users]}},
-    ]})
     result = []
     for u in users:
         pu = public_user(u)
@@ -302,7 +314,7 @@ def get_chat(other_id: str, ctx=Depends(get_current_session)):
     other = resolve_user(other_id)
     if not other:
         raise HTTPException(status_code=404, detail="User not found")
-    # if blocked either way, hide media urls and avatars, but still show existing text? We'll restrict entirely
+    # if blocked either way, restrict entirely
     if db["block"].find_one({"blocker_id": ctx["user"]["_id"], "blocked_id": other["_id"]}) or \
        db["block"].find_one({"blocker_id": other["_id"], "blocked_id": ctx["user"]["_id"]}):
         raise HTTPException(status_code=403, detail="Conversation is blocked")
@@ -388,6 +400,29 @@ def unblock_user(user_id: str, ctx=Depends(get_current_session)):
     return {"ok": True}
 
 
+# Upload endpoint for media and avatars
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...), ctx=Depends(get_current_session)):
+    # Determine extension and basic type
+    content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+    allowed_prefixes = ["image/", "video/", "audio/"]
+    if not any(content_type.startswith(p) for p in allowed_prefixes):
+        raise HTTPException(status_code=400, detail="Only image, video or audio files are allowed")
+
+    ext = os.path.splitext(file.filename)[1].lower() or (mimetypes.guess_extension(content_type) or "")
+    fname = f"{uuid4().hex}{ext}"
+    dest_path = os.path.join(UPLOAD_DIR, fname)
+    try:
+        with open(dest_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to save file")
+
+    url = f"/uploads/{fname}"
+    kind = "image" if content_type.startswith("image/") else ("video" if content_type.startswith("video/") else "audio")
+    return {"url": url, "kind": kind}
+
+
 # Admin endpoints
 
 def require_admin(ctx=Depends(get_current_session)):
@@ -404,11 +439,12 @@ def admin_list_users(ctx=Depends(require_admin)):
     for u in users:
         last_sess = db["session"].find({"user_id": u["_id"]}).sort("created_at", -1).limit(1)
         last_ip = None
-        if last_sess and last_sess.count(True) > 0:
-            try:
-                last_ip = list(last_sess)[0].get("ip")
-            except Exception:
-                last_ip = None
+        try:
+            last_sess_list = list(last_sess)
+            if len(last_sess_list) > 0:
+                last_ip = last_sess_list[0].get("ip")
+        except Exception:
+            last_ip = None
         item = public_user(u)
         item["is_admin"] = u.get("is_admin", False)
         item["last_ip"] = last_ip
@@ -473,70 +509,6 @@ def admin_edit_user(user_id: str, payload: AdminEditUserPayload, ctx=Depends(req
         create_document("adminlog", log)
     nu = db["user"].find_one({"_id": u["_id"]})
     return public_user(nu)
-
-
-@app.get("/admin/logs")
-def admin_logs(ctx=Depends(require_admin)):
-    logs = list(db["adminlog"].find({}).sort("created_at", -1).limit(200))
-    def fmt(l):
-        return {
-            "id": str(l["_id"]),
-            "action": l.get("action"),
-            "actor_id": l.get("actor_id"),
-            "target_id": l.get("target_id"),
-            "details": l.get("details"),
-            "created_at": l.get("created_at"),
-        }
-    return [fmt(l) for l in logs]
-
-
-# PDF backup
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-except Exception:
-    letter = None
-    canvas = None
-
-
-@app.get("/admin/backup.pdf")
-def admin_backup_pdf(response: Response, ctx=Depends(require_admin)):
-    if canvas is None:
-        raise HTTPException(status_code=500, detail="PDF library not available")
-    import io
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
-
-    y = height - 40
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, y, "Slash Messenger Users Backup")
-    y -= 24
-    c.setFont("Helvetica", 10)
-    c.drawString(40, y, f"Generated: {datetime.now(timezone.utc).isoformat()}")
-    y -= 20
-
-    users = list(db["user"].find({}).sort("created_at", 1))
-    for u in users:
-        if y < 80:
-            c.showPage()
-            y = height - 40
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(40, y, f"{u.get('name')} (@{u.get('username')})")
-        y -= 16
-        c.setFont("Helvetica", 10)
-        c.drawString(60, y, f"Number: {u.get('number')} | Active: {u.get('is_active', True)} | Admin: {u.get('is_admin', False)}")
-        y -= 14
-        c.drawString(60, y, f"Avatar: {u.get('avatar_url') or '-'} | Bio: {u.get('bio') or '-'}")
-        y -= 18
-
-    c.showPage()
-    c.save()
-    pdf = buffer.getvalue()
-    buffer.close()
-
-    response.headers["Content-Disposition"] = "attachment; filename=slash_users_backup.pdf"
-    return Response(content=pdf, media_type="application/pdf")
 
 
 if __name__ == "__main__":
