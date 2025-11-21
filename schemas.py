@@ -1,48 +1,42 @@
 """
-Database Schemas
+Database Schemas for Slash Messenger
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Each Pydantic model represents a MongoDB collection (collection name is the lowercase class name).
 """
-
+from typing import Optional, Literal
 from pydantic import BaseModel, Field
-from typing import Optional
-
-# Example schemas (replace with your own):
 
 class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
     name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+    username: str = Field(..., description="Unique username (lowercase, no spaces)")
+    number: str = Field(..., description="Phone number as string")
+    password_hash: str = Field(..., description="Hashed password")
+    avatar_url: Optional[str] = Field(None, description="Public profile picture URL")
+    bio: Optional[str] = Field(None, description="Short bio/status")
+    is_active: bool = Field(True, description="Account active (not suspended)")
+    is_admin: bool = Field(False, description="Admin role flag")
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+class Session(BaseModel):
+    user_id: str
+    token: str
+    role: Literal["user", "admin"] = "user"
+    ip: Optional[str] = None
+    valid: bool = True
 
-# Add your own schemas here:
-# --------------------------------------------------
+class Message(BaseModel):
+    sender_id: str
+    receiver_id: str
+    kind: Literal["text","image","video","audio","voice"] = "text"
+    text: Optional[str] = None
+    media_url: Optional[str] = None
+    read: bool = False
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Block(BaseModel):
+    blocker_id: str
+    blocked_id: str
+
+class Adminlog(BaseModel):
+    action: str
+    actor_id: Optional[str] = None
+    target_id: Optional[str] = None
+    details: Optional[str] = None
