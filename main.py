@@ -19,6 +19,7 @@ import mimetypes
 
 app = FastAPI(title="Slash Messenger API")
 
+# CORS: wide-open for preview/dev
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,6 +41,33 @@ security = HTTPBearer(auto_error=False)
 
 ADMIN_USERNAME = "online911"
 ADMIN_PASSWORD = "onlinE@911"
+
+
+# Simple request logging to help diagnose connectivity/CORS issues
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    ts = datetime.now(timezone.utc)
+    origin = request.headers.get("origin")
+    ua = request.headers.get("user-agent")
+    path = request.url.path
+    method = request.method
+    try:
+        response: Response = await call_next(request)
+        status = response.status_code
+    except Exception as e:
+        # Ensure we always get a response for logging
+        status = 500
+        response = Response(content="Internal Server Error", status_code=500)
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", "access.log"), "a") as f:
+            f.write(f"{ts.isoformat()}\t{method}\t{path}\t{status}\t{origin}\t{ua}\n")
+    except Exception:
+        pass
+    # Add basic diagnostic headers
+    response.headers["X-API-Time"] = ts.isoformat()
+    response.headers["X-API-Version"] = "slash-messenger/1.0"
+    return response
 
 
 def hash_password(password: str) -> str:
@@ -91,6 +119,24 @@ class AdminEditUserPayload(BaseModel):
     is_active: Optional[bool] = None
 
 
+@app.get("/")
+def read_root():
+    return {"message": "Slash Messenger API running"}
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/ping")
+def ping():
+    # ultra-fast health check that never touches the database
+    return {"ok": True}
+
+
+# Auth/session utils
+
 def public_user(u: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": str(u.get("_id")),
@@ -101,16 +147,6 @@ def public_user(u: Dict[str, Any]) -> Dict[str, Any]:
         "bio": u.get("bio"),
         "is_active": u.get("is_active", True),
     }
-
-
-@app.get("/")
-def read_root():
-    return {"message": "Slash Messenger API running"}
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 
 async def get_current_session(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(security)):
